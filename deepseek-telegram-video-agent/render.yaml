@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: deepseek-telegram-video-agent
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        generateValue: true
