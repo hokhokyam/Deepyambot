@@ -1,9 +1,8 @@
 services:
   - type: web
-    name: coarena-telegram-video-bot
+    name: deepyam-ai-social
     runtime: docker
     plan: free
-    healthCheckPath: /
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -11,5 +10,5 @@ services:
         sync: false
       - key: COARENA_MODEL
         sync: false
-      - key: WEBHOOK_SECRET
-        generateValue: true
+      - key: WEBHOOK_URL
+        sync: false
