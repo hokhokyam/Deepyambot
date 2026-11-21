@@ -39,8 +39,8 @@ WEBHOOK_SECRET = os.environ.get(
 )
 
 client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
+    api_key=os.getenv("COARENA_API_KEY"),
+    base_url="https://coarena.ai/api/v1"
 )
 
 # Telegram bot
