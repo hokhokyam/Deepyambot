@@ -1,36 +1,37 @@
-# DeepSeek + Telegram Video Editing Agent (Render)
+# Coarena Telegram AI + Video Bot
 
-A starter bot: send a video to Telegram with an instruction in its caption. DeepSeek converts the instruction to a restricted JSON edit plan; FFmpeg executes supported edits.
+## Files
+- `main.py`: Telegram webhook, natural AI chat with short in-memory context, basic video compress/MP4 conversion
+- `Dockerfile`: installs FFmpeg and Python dependencies
+- `render.yaml`: Render Blueprint settings
 
-## Supported first version
-- compress (default)
-- convert to MP4
-- trim using timestamps
-- resize width
-- overlay a short text caption
+## Required Render environment variables
+1. `TELEGRAM_BOT_TOKEN` — token from BotFather
+2. `COARENA_API_KEY` — your Coarena API key (never commit it)
+3. `COARENA_MODEL` — exact model ID that Coarena marks **Free**
+4. `WEBHOOK_SECRET` — Render generates this through Blueprint (optional if set manually)
+
+Render automatically provides `RENDER_EXTERNAL_URL` and `PORT`.
+
+## Coarena API
+OpenAI-compatible base URL: `https://coarena.ai/api/v1`
+The code uses the model selected in `COARENA_MODEL`. Do not guess the model name; choose a currently Free model in your Coarena model list. Free tiers have daily/rate limits and availability can change.
 
 ## Deploy
-1. Create a Telegram bot with **@BotFather** and copy its token.
-2. Create a DeepSeek API key in the DeepSeek platform. API usage may cost money; Render hosting being free does not make the AI API free.
-3. Push this repository to your own GitHub repository.
-4. In Render, choose **New → Web Service**, connect the GitHub repo, choose the Docker runtime and Free plan.
-5. Add environment variables:
-   - `TELEGRAM_BOT_TOKEN` = BotFather token
-   - `DEEPSEEK_API_KEY` = DeepSeek API key
-   - `TELEGRAM_WEBHOOK_SECRET` = long random secret
-6. Deploy. Copy the Render service URL if needed; Render sets `RENDER_EXTERNAL_URL` automatically.
-7. Open the bot in Telegram and send `/start`.
+1. Upload these files to the root of your GitHub repository.
+2. In Render, create or update a Docker web service connected to the repository. Root directory should be blank.
+3. Add the environment variables above and deploy.
+4. Visit the Render service URL; `/` should return `{"ok": true, ...}`.
 
-## Example caption on a video
-`Trim from 00:00:02 to 00:00:10 and compress`
+## Bot commands
+- `/start`, `/help`
+- `/ai your prompt`
+- `/reset` clears the chat context
+- Plain text messages are sent to the AI
+- Send a video with caption `compress` or `convert mp4`
 
-## Important free-tier notes
-- This uses a webhook, not long-running polling, because Render Free web services sleep after inactivity and can restart.
-- Free Render filesystem is ephemeral. This implementation processes videos in a temporary directory and sends the output back; it does not keep a video library.
-- Free services have limited CPU/RAM and can be unsuitable for long/high-resolution clips. Start with short 480p/720p videos.
-- Telegram and hosting impose upload/processing limits; very large clips may fail.
-- The bot token and DeepSeek key must be Render environment variables, never committed to GitHub.
-- FFmpeg is included in the Docker image.
-
-## Editing behavior
-DeepSeek is not generating video frames. It interprets the user's request; FFmpeg performs the actual media operation. Review and extend `render_video()` before enabling additional edit types.
+## Important limitations
+- Chat context is stored in RAM and resets after service restart/sleep; this is not persistent database memory.
+- Render Free may sleep when inactive and wake slowly.
+- Video files are processed temporarily and not retained.
+- Only compression and MP4 conversion are implemented in this starter. It does not yet implement arbitrary AI-directed edits, trim, subtitles, or effects.

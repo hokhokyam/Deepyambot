@@ -1,780 +1,260 @@
-
 import os
+import re
 import json
-import tempfile
-import subprocess
 import logging
 import asyncio
+import tempfile
+import subprocess
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
-from openai import OpenAI
+from openai import AsyncOpenAI
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
-
-# =====================================================
-# CONFIGURATION
-# =====================================================
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("coarena-bot")
 
-logger = logging.getLogger("video-agent")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+COARENA_API_KEY = os.getenv("COARENA_API_KEY", "").strip()
+COARENA_MODEL = os.getenv("COARENA_MODEL", "").strip()  # Must be a model marked Free in Coarena
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
+if not COARENA_API_KEY:
+    raise RuntimeError("Missing COARENA_API_KEY environment variable")
+if not COARENA_MODEL:
+    raise RuntimeError("Missing COARENA_MODEL environment variable. Set it to a Coarena model marked Free.")
 
-RENDER_URL = os.environ.get(
-    "RENDER_EXTERNAL_URL", ""
-).rstrip("/")
-
-WEBHOOK_SECRET = os.environ.get(
-    "TELEGRAM_WEBHOOK_SECRET",
-    "change-this-secret"
+ai = AsyncOpenAI(
+    api_key=COARENA_API_KEY,
+    base_url="https://coarena.ai/api/v1",
+    timeout=90.0,
+    max_retries=2,
 )
 
-client = OpenAI(
-    api_key=os.getenv("COARENA_API_KEY"),
-    base_url="https://coarena.ai/api/v1"
+# In-memory chat context. It clears when the Render service restarts/sleeps.
+# Keep only the last 12 messages per chat to limit token usage.
+chat_history: dict[int, list[dict[str, str]]] = {}
+MAX_HISTORY_MESSAGES = 12
+SYSTEM_PROMPT = (
+    "You are a helpful, natural conversational AI assistant inside a Telegram bot. "
+    "Reply in the language the user uses (often Tagalog/Filipino or English). "
+    "Be friendly, clear, honest, and concise. Do not claim to have edited a video "
+    "unless the bot actually processed and returned a file."
 )
 
-# Telegram bot
-telegram_app = (
-    Application.builder()
-    .token(BOT_TOKEN)
-    .build()
-)
-
-# FastAPI server
-app = FastAPI()
+telegram_app: Application | None = None
 
 
-# =====================================================
-# DEEPSEEK VIDEO EDITING PLAN
-# =====================================================
-
-SYSTEM_PROMPT = """
-You are an AI video editing planner.
-
-Return ONLY valid JSON in this format:
-
-{
-  "action": "compress",
-  "start": "00:00:00",
-  "end": "00:00:10",
-  "caption": "My Video",
-  "width": 720
-}
-
-Allowed actions:
-- compress
-- convert
-- trim
-- caption
-- resize
-
-Rules:
-- Default action is compress.
-- For trim, use the requested start and end times.
-- For caption, use the requested caption text.
-- For resize, use the requested width.
-- Never return shell commands.
-- Never return executable code.
-- Never return FFmpeg filters.
-- Width must be between 320 and 1280.
-"""
-
-
-def get_ai_plan(user_instruction):
-    response = deepseek.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": user_instruction[:1500]
-            }
-        ],
-        response_format={
-            "type": "json_object"
-        }
-    )
-
-    result = json.loads(
-        response.choices[0].message.content
-    )
-
-    allowed_actions = {
-        "compress",
-        "convert",
-        "trim",
-        "caption",
-        "resize"
-    }
-
-    if result.get("action") not in allowed_actions:
-        result["action"] = "compress"
-
+async def ask_ai(chat_id: int, user_text: str) -> str:
+    history = chat_history.setdefault(chat_id, [])
+    history.append({"role": "user", "content": user_text})
+    # Limit history and always keep a valid sequence of recent turns.
+    history[:] = history[-MAX_HISTORY_MESSAGES:]
     try:
-        width = int(result.get("width", 720))
-    except (ValueError, TypeError):
-        width = 720
-
-    result["width"] = max(
-        320,
-        min(1280, width)
-    )
-
-    return result
-
-
-# =====================================================
-# DEEPSEEK CHAT
-# =====================================================
-
-def ask_deepseek(user_prompt):
-    response = deepseek.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are DeepSeek, a helpful AI assistant "
-                    "inside a Telegram bot. "
-                    "Answer clearly and conversationally. "
-                    "You can help with video editing, "
-                    "technology, coding, and general questions."
-                )
-            },
-            {
-                "role": "user",
-                "content": user_prompt[:3000]
-            }
-        ]
-    )
-
-    return response.choices[0].message.content
-
-
-# =====================================================
-# TIMESTAMP UTILITIES
-# =====================================================
-
-def parse_timestamp(
-    value,
-    fallback="00:00:00"
-):
-    if not isinstance(value, str):
-        return fallback
-
-    parts = value.split(":")
-
-    if len(parts) not in (2, 3):
-        return fallback
-
-    try:
-        numbers = [
-            int(part) for part in parts
-        ]
-    except ValueError:
-        return fallback
-
-    if any(number < 0 for number in numbers):
-        return fallback
-
-    if any(number > 59 for number in numbers[1:]):
-        return fallback
-
-    return value
-
-
-def timestamp_to_seconds(value):
-    parts = [
-        int(part) for part in value.split(":")
-    ]
-
-    if len(parts) == 2:
-        minutes, seconds = parts
-
-        return (
-            minutes * 60
-            + seconds
+        result = await ai.chat.completions.create(
+            model=COARENA_MODEL,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}, *history],
+            temperature=0.7,
+            max_tokens=900,
         )
-
-    hours, minutes, seconds = parts
-
-    return (
-        hours * 3600
-        + minutes * 60
-        + seconds
-    )
-
-
-# =====================================================
-# FFmpeg VIDEO EDITOR
-# =====================================================
-
-def render_video(
-    source,
-    output,
-    plan,
-    temp_dir
-):
-    action = plan.get(
-        "action",
-        "compress"
-    )
-
-    command = ["ffmpeg", "-y"]
-
-    # ---------------------------------------------
-    # TRIM
-    # ---------------------------------------------
-
-    if action == "trim":
-
-        start = parse_timestamp(
-            plan.get("start"),
-            "00:00:00"
-        )
-
-        end = parse_timestamp(
-            plan.get("end"),
-            "00:00:15"
-        )
-
-        start_seconds = timestamp_to_seconds(
-            start
-        )
-
-        end_seconds = timestamp_to_seconds(
-            end
-        )
-
-        duration = (
-            end_seconds - start_seconds
-        )
-
-        if duration <= 0:
-            duration = 15
-
-        command += [
-            "-ss",
-            start,
-            "-i",
-            str(source),
-            "-t",
-            str(duration)
-        ]
-
-    else:
-        command += [
-            "-i",
-            str(source)
-        ]
-
-    command += [
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?"
-    ]
-
-    # ---------------------------------------------
-    # RESIZE
-    # ---------------------------------------------
-
-    if action == "resize":
-
-        width = plan.get(
-            "width",
-            720
-        )
-
-        command += [
-            "-vf",
-            f"scale={width}:-2"
-        ]
-
-    # ---------------------------------------------
-    # CAPTION
-    # ---------------------------------------------
-
-    elif action == "caption":
-
-        caption = str(
-            plan.get(
-                "caption",
-                "Edited with AI"
-            )
-        )[:120]
-
-        caption_file = (
-            Path(temp_dir)
-            / "caption.txt"
-        )
-
-        caption_file.write_text(
-            caption,
-            encoding="utf-8"
-        )
-
-        caption_path = str(
-            caption_file
-        ).replace("\\", "/").replace(
-            ":",
-            r"\:"
-        )
-
-        command += [
-            "-vf",
-            (
-                "drawtext="
-                f"textfile='{caption_path}':"
-                "fontcolor=white:"
-                "fontsize=30:"
-                "borderw=2:"
-                "x=(w-text_w)/2:"
-                "y=h-80"
-            )
-        ]
-
-    # ---------------------------------------------
-    # VIDEO ENCODING
-    # ---------------------------------------------
-
-    command += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "28",
-        "-c:a",
-        "aac",
-        "-movflags",
-        "+faststart",
-        str(output)
-    ]
-
-    subprocess.run(
-        command,
-        check=True,
-        timeout=600,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE
-    )
-
-    return output
-
-
-# =====================================================
-# /START COMMAND
-# =====================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.effective_message
-
-    await message.reply_text(
-        "Hello! I'm your AI Video Editing Bot. 🤖\n\n"
-        "I'm online and ready!\n\n"
-        "AI CHAT:\n"
-        "/ai hello\n"
-        "/ai explain artificial intelligence\n\n"
-        "VIDEO EDITING:\n"
-        "Send a video with an instruction in its caption.\n\n"
-        "Examples:\n"
-        "• Compress this video\n"
-        "• Trim from 00:00:03 to 00:00:12\n"
-        "• Resize to 720px\n"
-        "• Add caption: My travel vlog\n\n"
-        "DeepSeek plans the edit and FFmpeg renders it."
-    )
-
-
-# =====================================================
-# /HELP COMMAND
-# =====================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await start_command(
-        update,
-        context
-    )
-
-
-# =====================================================
-# /AI COMMAND
-# =====================================================
-
-async def ai_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.effective_message
-
-    user_prompt = " ".join(
-        context.args
-    ).strip()
-
-    if not user_prompt:
-
-        await message.reply_text(
-            "🤖 DeepSeek AI Chat\n\n"
-            "Example:\n"
-            "/ai hello\n"
-            "/ai give me video editing ideas\n"
-            "/ai explain Python"
-        )
-
-        return
-
-    status = await message.reply_text(
-        "🧠 DeepSeek is thinking..."
-    )
-
-    try:
-
-        answer = await asyncio.to_thread(
-            ask_deepseek,
-            user_prompt
-        )
-
+        answer = (result.choices[0].message.content or "").strip()
         if not answer:
-            answer = (
-                "DeepSeek returned an empty response."
-            )
-
-        # Telegram messages have a length limit.
-        answer = answer[:4000]
-
-        await status.edit_text(
-            answer
-        )
-
-    except Exception:
-
-        logger.exception(
-            "DeepSeek chat error"
-        )
-
-        await status.edit_text(
-            "❌ DeepSeek API error.\n\n"
-            "Please check your DEEPSEEK_API_KEY "
-            "and Render Logs."
+            answer = "Walang text na ibinalik ng model. Subukan ulit."
+        history.append({"role": "assistant", "content": answer})
+        history[:] = history[-MAX_HISTORY_MESSAGES:]
+        return answer
+    except Exception as exc:
+        log.exception("Coarena request failed")
+        history.pop()  # Remove failed user request from memory
+        return (
+            "Hindi ako makakonekta sa Coarena ngayon. "
+            "Pakitingnan ang COARENA_MODEL (dapat Free model), API key, at free daily limit. "
+            f"Error: {type(exc).__name__}"
         )
 
 
-# =====================================================
-# NORMAL TEXT MESSAGES
-# =====================================================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Hi! Ako ang AI video/chat bot mo. 🤖\n\n"
+            "Mag-message lang para makipag-usap sa AI.\n"
+            "Mag-send ng video at caption na 'compress' para i-compress.\n"
+            "Commands: /help, /reset, /ai <message>"
+        )
 
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.effective_message
 
-    if not message or not message.text:
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Paano gamitin:\n"
+            "• Normal text: AI chat\n"
+            "• /ai tanong: diretsong AI prompt\n"
+            "• /reset: burahin ang chat context sa memory\n"
+            "• Mag-send ng video na may caption 'compress' para i-compress\n"
+            "• Caption 'convert mp4' para gawing MP4\n\n"
+            "Video editing sa version na ito: compress at convert MP4. "
+            "Ang ibang advanced edit ay hindi pa naka-enable."
+        )
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id if update.effective_chat else None
+    if cid is not None:
+        chat_history.pop(cid, None)
+    if update.effective_message:
+        await update.effective_message.reply_text("Na-reset ang conversational context. Simula ulit tayo!")
+
+
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message or not update.effective_chat:
         return
-
-    user_text = (
-        message.text.lower().strip()
-    )
-
-    if user_text in [
-        "hi",
-        "hello",
-        "hey",
-        "test"
-    ]:
-
-        await message.reply_text(
-            "Hello! 👋\n\n"
-            "I'm online and ready.\n\n"
-            "Use /ai followed by your question "
-            "to chat with DeepSeek.\n\n"
-            "Send a video with an editing instruction "
-            "in its caption to edit it."
-        )
-
-    else:
-
-        await message.reply_text(
-            "I received your message! ✅\n\n"
-            "To chat with DeepSeek, use:\n"
-            "/ai your question\n\n"
-            "To edit a video, send a video file "
-            "with your instruction in its caption."
-        )
-
-
-# =====================================================
-# VIDEO HANDLER
-# =====================================================
-
-async def video_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.effective_message
-
-    media = message.video
-
-    if not media and message.document:
-
-        mime_type = (
-            message.document.mime_type
-            or ""
-        )
-
-        if mime_type.startswith("video/"):
-            media = message.document
-
-    if not media:
-
-        await message.reply_text(
-            "Please send a video file."
-        )
-
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.effective_message.reply_text("Gamit: /ai <tanong mo>")
         return
+    msg = await update.effective_message.reply_text("Nag-iisip...")
+    answer = await ask_ai(update.effective_chat.id, prompt)
+    await msg.edit_text(answer)
 
-    status = await message.reply_text(
-        "📥 Receiving your video..."
-    )
 
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message or not update.effective_chat:
+        return
+    user_text = (update.effective_message.text or "").strip()
+    if not user_text:
+        return
+    pending = await update.effective_message.reply_text("...")
+    answer = await ask_ai(update.effective_chat.id, user_text)
     try:
-
-        with tempfile.TemporaryDirectory() as temp:
-
-            temp_dir = Path(temp)
-
-            input_file = (
-                temp_dir / "input.mp4"
-            )
-
-            output_file = (
-                temp_dir / "edited.mp4"
-            )
-
-            # Download from Telegram
-            telegram_file = (
-                await context.bot.get_file(
-                    media.file_id
-                )
-            )
-
-            await telegram_file.download_to_drive(
-                input_file
-            )
-
-            instruction = (
-                message.caption
-                or "Compress this video"
-            )
-
-            # Ask DeepSeek for editing plan
-            await status.edit_text(
-                "🧠 DeepSeek is planning your edit..."
-            )
-
-            plan = await asyncio.to_thread(
-                get_ai_plan,
-                instruction
-            )
-
-            # Render video
-            await status.edit_text(
-                "🎬 FFmpeg is editing your video..."
-            )
-
-            result = await asyncio.to_thread(
-                render_video,
-                input_file,
-                output_file,
-                plan,
-                temp_dir
-            )
-
-            # Send result
-            await status.edit_text(
-                "📤 Sending your edited video..."
-            )
-
-            with open(
-                result,
-                "rb"
-            ) as video:
-
-                await message.reply_video(
-                    video=video,
-                    caption=(
-                        "✅ Video edited successfully!\n"
-                        f"Action: {plan['action']}\n"
-                        "Powered by DeepSeek + FFmpeg"
-                    )
-                )
-
-            await status.delete()
-
-    except subprocess.TimeoutExpired:
-
-        await status.edit_text(
-            "⏱️ Video processing timed out.\n\n"
-            "Try a shorter or smaller video."
-        )
-
+        await pending.edit_text(answer)
     except Exception:
+        await update.effective_message.reply_text(answer)
 
-        logger.exception(
-            "Video processing error"
+
+def safe_video_action(caption: str) -> str:
+    """Basic supported actions selected from the user's caption."""
+    c = (caption or "").lower()
+    if any(word in c for word in ("compress", "compressed", "paliitin", "liitan", "reduce size")):
+        return "compress"
+    if any(word in c for word in ("convert mp4", "to mp4", "gawing mp4", "mp4 format")):
+        return "mp4"
+    return "unsupported"
+
+
+async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message:
+        return
+    media = message.video or (message.document if message.document and
+                              (message.document.mime_type or "").startswith("video/") else None)
+    if not media:
+        return
+
+    action = safe_video_action(message.caption or "")
+    if action == "unsupported":
+        await message.reply_text(
+            "Nakuha ko ang video. Sa ngayon, caption na 'compress' o 'convert mp4' "
+            "ang supported. Magdagdag ng caption at i-send ulit."
         )
+        return
 
-        await status.edit_text(
-            "❌ I couldn't process your video.\n\n"
-            "Try a short MP4 video.\n"
-            "If the problem continues, check Render Logs."
-        )
-
-
-# =====================================================
-# REGISTER TELEGRAM HANDLERS
-# =====================================================
-
-telegram_app.add_handler(
-    CommandHandler(
-        "start",
-        start_command
-    )
-)
-
-telegram_app.add_handler(
-    CommandHandler(
-        "help",
-        help_command
-    )
-)
-
-# DeepSeek AI command
-telegram_app.add_handler(
-    CommandHandler(
-        "ai",
-        ai_command
-    )
-)
-
-# Normal text messages
-telegram_app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        text_handler
-    )
-)
-
-# Video messages
-telegram_app.add_handler(
-    MessageHandler(
-        filters.VIDEO
-        | filters.Document.VIDEO,
-        video_handler
-    )
-)
+    status = await message.reply_text("Pinoproseso ang video…")
+    with tempfile.TemporaryDirectory(prefix="tgvideo_") as tmp:
+        inp = Path(tmp) / "input"
+        out = Path(tmp) / ("compressed.mp4" if action == "compress" else "converted.mp4")
+        try:
+            tg_file = await context.bot.get_file(media.file_id)
+            await tg_file.download_to_drive(custom_path=str(inp))
+            if action == "compress":
+                cmd = [
+                    "ffmpeg", "-y", "-i", str(inp),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                    str(out)
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-i", str(inp),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                    str(out)
+                ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not out.exists():
+                log.error("ffmpeg failed: %s", stderr.decode(errors="ignore")[-2500:])
+                await status.edit_text("Hindi naproseso ang video. Baka unsupported codec o masyadong malaki.")
+                return
+            with out.open("rb") as f:
+                await message.reply_document(document=f, filename=out.name, caption="Tapos na! 🎬")
+            await status.delete()
+        except Exception:
+            log.exception("Video processing failed")
+            await status.edit_text("Nagkaproblema sa pag-download o pagproseso ng video.")
 
 
-# =====================================================
-# RENDER WEBHOOK
-# =====================================================
+def build_telegram_app() -> Application:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, video_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    return app
 
-@app.on_event("startup")
-async def startup():
 
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI):
+    global telegram_app
+    telegram_app = build_telegram_app()
     await telegram_app.initialize()
-
     await telegram_app.start()
 
-    if RENDER_URL:
-
-        webhook_url = (
-            f"{RENDER_URL}/telegram/"
-            f"{WEBHOOK_SECRET}"
-        )
-
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/telegram"
         await telegram_app.bot.set_webhook(
-            webhook_url
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET or None,
+            allowed_updates=["message"],
         )
-
-        logger.info(
-            "Telegram webhook configured"
-        )
-
-    logger.info(
-        "Bot started successfully"
-    )
-
-
-@app.on_event("shutdown")
-async def shutdown():
-
-    await telegram_app.stop()
-
-    await telegram_app.shutdown()
+        log.info("Telegram webhook configured: %s", webhook_url)
+    else:
+        log.warning("RENDER_EXTERNAL_URL not set; webhook was not configured.")
+    yield
+    if telegram_app:
+        await telegram_app.stop()
+        await telegram_app.shutdown()
 
 
-# =====================================================
-# HEALTH CHECK
-# =====================================================
+app = FastAPI(title="Coarena Telegram AI Bot", lifespan=lifespan)
+
 
 @app.get("/")
-async def health_check():
-
-    return {
-        "status": "online",
-        "service": "DeepSeek Telegram Video Agent"
-    }
+async def health():
+    return {"ok": True, "service": "coarena-telegram-bot"}
 
 
-# =====================================================
-# TELEGRAM WEBHOOK ENDPOINT
-# =====================================================
-
-@app.post("/telegram/{secret}")
-async def telegram_webhook(
-    secret: str,
-    request: Request
-):
-
-    if secret != WEBHOOK_SECRET:
-
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid webhook secret"
-        )
-
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    global telegram_app
+    if telegram_app is None:
+        raise HTTPException(status_code=503, detail="Bot is starting")
+    if WEBHOOK_SECRET:
+        received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if received != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
     data = await request.json()
-
-    update = Update.de_json(
-        data,
-        telegram_app.bot
-    )
-
-    await telegram_app.update_queue.put(
-        update
-    )
-
-    return {
-        "ok": True
-    }
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
