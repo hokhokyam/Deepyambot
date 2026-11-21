@@ -1,15 +1,19 @@
 
 import os
+import re
 import json
 import uuid
-import shutil
 import asyncio
 import logging
+import sqlite3
+import shutil
 import subprocess
+
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
+from openai import AsyncOpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -18,173 +22,227 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import AsyncOpenAI
 
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-COARENA_API_KEY = os.getenv("COARENA_API_KEY", "")
-COARENA_MODEL = os.getenv("COARENA_MODEL", "deepseek-chat")
-COARENA_BASE_URL = os.getenv(
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+AI_KEY = os.environ["COARENA_API_KEY"]
+AI_MODEL = os.getenv("COARENA_MODEL", "deepseek-chat")
+AI_BASE_URL = os.getenv(
     "COARENA_BASE_URL",
-    "https://coarena.ai/api/v1"
+    "https://coarena.ai/api/v1",
 )
 
 PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-this-secret")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "replace-this-secret")
 
+# Set WORK_DIR=/var/data/deepyam if you have a Render disk
 WORK_DIR = Path(os.getenv("WORK_DIR", "/tmp/deepyam"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = str(WORK_DIR / "deepyam.sqlite3")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("deepyam")
 
-if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-
-if not COARENA_API_KEY:
-    raise RuntimeError("Missing COARENA_API_KEY")
-
 client = AsyncOpenAI(
-    api_key=COARENA_API_KEY,
-    base_url=COARENA_BASE_URL,
+    api_key=AI_KEY,
+    base_url=AI_BASE_URL,
 )
 
 app = FastAPI()
-telegram_app = Application.builder().token(BOT_TOKEN).build()
+bot_app = Application.builder().token(BOT_TOKEN).build()
 
-# --------------------------------------------------
-# CONVERSATION STATE
-# --------------------------------------------------
-# RAM-based for this starter deployment.
-# Render restart clears this state.
+# Prevent simultaneous edits/uploads by the same Telegram user.
+user_locks: dict[int, asyncio.Lock] = {}
 
-sessions: dict[int, dict[str, Any]] = {}
+def get_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
 
-def get_session(user_id: int):
-    if user_id not in sessions:
-        sessions[user_id] = {
-            "messages": [],
-            "video": None,
-            "platform": "tiktok",
-        }
-    return sessions[user_id]
+# =========================================================
+# SQLITE STATE
+# =========================================================
 
-# --------------------------------------------------
-# FFMPEG HELPERS
-# --------------------------------------------------
+def db():
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    return connection
 
-def ffmpeg_exists():
-    return shutil.which("ffmpeg") is not None
+def init_db():
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                active_video TEXT,
+                platform TEXT DEFAULT 'tiktok',
+                history TEXT DEFAULT '[]'
+            )
+        """)
 
-def run_ffmpeg(args: list[str]):
-    command = ["ffmpeg", "-y", "-hide_banner"] + args
+def ensure_user(user_id: int):
+    with db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
+            (user_id,),
+        )
+
+def get_user(user_id: int) -> dict:
+    ensure_user(user_id)
+    with db() as con:
+        row = con.execute(
+            "SELECT * FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    return dict(row)
+
+def set_video(user_id: int, path: str):
+    ensure_user(user_id)
+    with db() as con:
+        con.execute(
+            "UPDATE users SET active_video=? WHERE user_id=?",
+            (path, user_id),
+        )
+
+def get_video(user_id: int) -> str | None:
+    data = get_user(user_id)
+    path = data.get("active_video")
+    if path and os.path.isfile(path):
+        return path
+    return None
+
+def set_platform(user_id: int, platform: str):
+    ensure_user(user_id)
+    with db() as con:
+        con.execute(
+            "UPDATE users SET platform=? WHERE user_id=?",
+            (platform, user_id),
+        )
+
+def get_history(user_id: int) -> list:
+    data = get_user(user_id)
+    try:
+        return json.loads(data.get("history") or "[]")
+    except Exception:
+        return []
+
+def save_history(user_id: int, history: list):
+    history = history[-24:]
+    with db() as con:
+        con.execute(
+            "UPDATE users SET history=? WHERE user_id=?",
+            (json.dumps(history, ensure_ascii=False), user_id),
+        )
+
+init_db()
+
+# =========================================================
+# FFMPEG
+# =========================================================
+
+def require_video(user_id: int) -> str:
+    path = get_video(user_id)
+    if not path:
+        raise RuntimeError(
+            "Wala akong mahanap na active video file. "
+            "I-upload muli ang video at hintaying matapos ang upload."
+        )
+    return path
+
+def ffprobe(path: str) -> dict:
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("ffprobe is missing. Install FFmpeg.")
+
     result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=900,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2500:])
-    return result
-
-def probe_video(path: str):
-    command = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries",
-        "format=duration:stream=codec_type,width,height",
-        "-of", "json",
-        path,
-    ]
-    result = subprocess.run(
-        command,
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,width,height",
+            "-of", "json",
+            path,
+        ],
         capture_output=True,
         text=True,
         timeout=60,
     )
+
     if result.returncode != 0:
-        raise RuntimeError("Hindi mabasa ang video metadata.")
+        raise RuntimeError("Hindi mabasa ang video file.")
+
     return json.loads(result.stdout)
 
-def output_path(user_id: int):
-    return str(WORK_DIR / f"{user_id}_{uuid.uuid4().hex[:8]}_edited.mp4")
+def ffmpeg(args: list[str]):
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner"] + args,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-1800:])
 
-def require_video(user_id: int):
-    video = get_session(user_id).get("video")
-    if not video or not os.path.exists(video):
-        raise RuntimeError(
-            "Wala akong active video. Mag-send muna ng video sa chat."
-        )
-    return video
+def new_output(user_id: int) -> str:
+    return str(
+        WORK_DIR / f"{user_id}_{uuid.uuid4().hex[:10]}_edit.mp4"
+    )
 
-# --------------------------------------------------
-# EDITING TOOLS
-# --------------------------------------------------
+def register_output(user_id: int, path: str) -> dict:
+    if not os.path.isfile(path) or os.path.getsize(path) < 1000:
+        raise RuntimeError("FFmpeg did not produce a valid output.")
+    ffprobe(path)
+    set_video(user_id, path)
+    return {"output": path, "success": True}
 
-def tool_video_info(user_id: int):
-    path = require_video(user_id)
-    return probe_video(path)
-
-def tool_compress(user_id: int, quality: str = "high"):
+def compress_video(user_id: int, quality: str = "small"):
     source = require_video(user_id)
-    target = output_path(user_id)
+    target = new_output(user_id)
 
-    presets = {
-        "high": "18",
-        "balanced": "23",
-        "small": "28",
+    crf_map = {
+        "high": 18,
+        "balanced": 23,
+        "small": 28,
     }
-    crf = presets.get(quality.lower(), "20")
+    crf = crf_map.get(quality.lower(), 28)
 
-    run_ffmpeg([
+    ffmpeg([
         "-i", source,
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", crf,
+        "-preset", "fast",
+        "-crf", str(crf),
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
         "-movflags", "+faststart",
         target,
     ])
+    return register_output(user_id, target)
 
-    get_session(user_id)["video"] = target
-    return {"output": target, "quality": quality}
-
-def tool_tiktok(user_id: int):
+def make_tiktok(user_id: int):
     source = require_video(user_id)
-    target = output_path(user_id)
+    target = new_output(user_id)
 
-    # Center-crop to vertical 9:16, then scale to 1080x1920.
-    run_ffmpeg([
+    ffmpeg([
         "-i", source,
         "-vf",
-        "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',"
         "scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920",
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "20",
         "-c:a", "aac",
-        "-b:a", "128k",
         "-movflags", "+faststart",
         target,
     ])
+    return register_output(user_id, target)
 
-    get_session(user_id)["video"] = target
-    return {"output": target, "format": "vertical 9:16"}
-
-def tool_brightness(user_id: int, amount: float = 0.08):
+def brightness(user_id: int, amount: float = 0.10):
     source = require_video(user_id)
-    target = output_path(user_id)
-
+    target = new_output(user_id)
     amount = max(-0.5, min(0.5, float(amount)))
 
-    run_ffmpeg([
+    ffmpeg([
         "-i", source,
         "-vf", f"eq=brightness={amount}:contrast=1.03",
         "-c:v", "libx264",
@@ -194,38 +252,13 @@ def tool_brightness(user_id: int, amount: float = 0.08):
         "-movflags", "+faststart",
         target,
     ])
+    return register_output(user_id, target)
 
-    get_session(user_id)["video"] = target
-    return {"output": target, "brightness": amount}
-
-def tool_trim(user_id: int, start: float, end: float):
+def mute_video(user_id: int):
     source = require_video(user_id)
-    target = output_path(user_id)
+    target = new_output(user_id)
 
-    start = max(0, float(start))
-    end = max(start + 0.1, float(end))
-    duration = end - start
-
-    run_ffmpeg([
-        "-ss", str(start),
-        "-i", source,
-        "-t", str(duration),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "20",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        target,
-    ])
-
-    get_session(user_id)["video"] = target
-    return {"output": target, "start": start, "end": end}
-
-def tool_mute(user_id: int):
-    source = require_video(user_id)
-    target = output_path(user_id)
-
-    run_ffmpeg([
+    ffmpeg([
         "-i", source,
         "-an",
         "-c:v", "libx264",
@@ -234,510 +267,361 @@ def tool_mute(user_id: int):
         "-movflags", "+faststart",
         target,
     ])
+    return register_output(user_id, target)
 
-    get_session(user_id)["video"] = target
-    return {"output": target, "audio": "muted"}
-
-def tool_add_text(user_id: int, text: str):
+def trim_video(user_id: int, start: float, end: float):
     source = require_video(user_id)
-    target = output_path(user_id)
+    target = new_output(user_id)
 
-    # Escape characters for FFmpeg drawtext.
-    safe = (
-        str(text)
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-        .replace("%", "\\%")
-        .replace(",", "\\,")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-    )
+    start = max(0, float(start))
+    end = float(end)
+    if end <= start:
+        raise ValueError("End time must be greater than start time.")
 
-    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
-    run_ffmpeg([
+    ffmpeg([
+        "-ss", str(start),
         "-i", source,
-        "-vf",
-        f"drawtext=fontfile={font}:text='{safe}':"
-        "fontcolor=white:fontsize=48:"
-        "borderw=3:bordercolor=black:"
-        "x=(w-text_w)/2:y=h*0.82",
+        "-t", str(end - start),
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "20",
-        "-c:a", "copy",
+        "-c:a", "aac",
         "-movflags", "+faststart",
         target,
     ])
+    return register_output(user_id, target)
 
-    get_session(user_id)["video"] = target
-    return {"output": target, "overlay": text}
+# =========================================================
+# NATURAL-LANGUAGE EDIT ROUTER
+# =========================================================
 
-# --------------------------------------------------
-# AI TOOL DEFINITIONS
-# --------------------------------------------------
+def detect_edit(text: str):
+    t = text.lower().strip()
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "video_info",
-            "description": "Inspect the active uploaded video.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
+    # Compression: "compress small", "make file smaller"
+    if any(x in t for x in [
+        "compress small", "compress it small",
+        "make it smaller", "smaller file",
+        "compress mo", "i-compress",
+        "compress this", "compress video",
+    ]):
+        quality = "small"
+        if "high quality" in t or "preserve quality" in t:
+            quality = "high"
+        elif "balanced" in t:
+            quality = "balanced"
+        return ("compress", {"quality": quality})
+
+    if any(x in t for x in [
+        "tiktok-ready", "tik tok ready",
+        "make it tiktok", "pang-tiktok",
+        "vertical 9:16",
+    ]):
+        return ("tiktok", {})
+
+    if any(x in t for x in [
+        "brighter", "brighten", "more bright",
+        "mas maliwanag", "liwanagan",
+    ]):
+        return ("brightness", {"amount": 0.12})
+
+    if any(x in t for x in [
+        "mute video", "remove audio",
+        "mute mo", "tanggalin audio",
+    ]):
+        return ("mute", {})
+
+    # Example: trim from 5 to 20 seconds
+    match = re.search(
+        r"(?:trim|cut).*?(\d+(?:\.\d+)?)\s*(?:s|sec|seconds)?"
+        r".*?(?:to|until|-)\s*(\d+(?:\.\d+)?)",
+        t,
+    )
+    if match:
+        return (
+            "trim",
+            {
+                "start": float(match.group(1)),
+                "end": float(match.group(2)),
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "compress_video",
-            "description": "Compress the active video. high preserves quality, balanced, small.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "quality": {
-                        "type": "string",
-                        "enum": ["high", "balanced", "small"],
-                    }
-                },
-                "required": ["quality"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "make_tiktok",
-            "description": "Convert active video to vertical TikTok 9:16 format.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "adjust_brightness",
-            "description": "Adjust brightness. Typical amount 0.05 to 0.20.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "amount": {
-                        "type": "number",
-                        "minimum": -0.5,
-                        "maximum": 0.5,
-                    }
-                },
-                "required": ["amount"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "trim_video",
-            "description": "Trim video using start and end seconds.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "start": {"type": "number"},
-                    "end": {"type": "number"},
-                },
-                "required": ["start", "end"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "mute_video",
-            "description": "Remove audio from the active video.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "add_text_overlay",
-            "description": "Add short text overlay to active video.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                },
-                "required": ["text"],
-            },
-        },
-    },
-]
+        )
 
-SYSTEM_PROMPT = """
-You are Deepyam, a friendly and capable AI video editor and social media assistant.
+    return None
 
-Understand natural Filipino/Tagalog, English, and mixed Taglish.
-Never require slash commands. The user can speak naturally.
+async def run_edit(user_id: int, action: str, args: dict):
+    if action == "compress":
+        return await asyncio.to_thread(
+            compress_video, user_id, args.get("quality", "small")
+        )
+    if action == "tiktok":
+        return await asyncio.to_thread(make_tiktok, user_id)
+    if action == "brightness":
+        return await asyncio.to_thread(
+            brightness, user_id, args.get("amount", 0.12)
+        )
+    if action == "mute":
+        return await asyncio.to_thread(mute_video, user_id)
+    if action == "trim":
+        return await asyncio.to_thread(
+            trim_video, user_id, args["start"], args["end"]
+        )
+    raise ValueError("Unknown edit action.")
 
-You can:
-- Answer questions conversationally.
-- Use video editing tools when the user requests an actual edit.
-- Use video_info before editing if duration or dimensions matter.
-- Make TikTok-ready videos.
-- Create captions, hooks, titles, descriptions, hashtags, and keywords
-  for YouTube, TikTok, or Facebook.
-- Give exactly five hashtags when the user asks for top five.
-- Explain that hashtag ranking is your relevance-based recommendation,
-  not live trend data, unless a live trends source is connected.
+# =========================================================
+# AI CHAT
+# =========================================================
 
-If the user asks to edit a video, use tools rather than merely claiming
-the edit is complete.
-If no video is uploaded, ask the user to send one.
-If a tool fails, tell the user honestly.
-After successful editing, say that the edited video will be sent.
-
-Keep replies natural, concise, and helpful.
-Do not invent video contents that you have not inspected.
+SYSTEM = """
+You are Deepyam, a helpful AI video editor and social media assistant.
+Understand natural Tagalog, English, and Taglish.
+Speak naturally and remember the conversation context.
+The user's selected platform is included in the context.
+Create captions, titles, descriptions, hooks, five hashtags,
+and keywords when requested.
+Hashtag suggestions are relevance-based, not live trend rankings.
+Never claim that a video was edited unless a tool succeeded.
+If user asks to edit but no video exists, ask them to upload it.
 """
 
-# --------------------------------------------------
-# AI CONVERSATION + TOOL LOOP
-# --------------------------------------------------
-
-async def ask_ai(user_id: int, user_text: str):
-    session = get_session(user_id)
-
-    platform = session.get("platform", "tiktok")
-    active_video = session.get("video")
-
-    context_note = (
-        f"Selected platform: {platform}. "
-        f"Active video available: "
-        f"{bool(active_video and os.path.exists(active_video))}."
-    )
+async def ask_ai(user_id: int, text: str) -> str:
+    user = get_user(user_id)
+    history = get_history(user_id)
+    video_exists = bool(get_video(user_id))
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + "\n" + context_note}
+        {
+            "role": "system",
+            "content": (
+                SYSTEM
+                + f"\nPlatform: {user.get('platform', 'tiktok')}"
+                + f"\nActive video exists: {video_exists}"
+            ),
+        }
     ]
+    messages.extend(history[-16:])
+    messages.append({"role": "user", "content": text})
 
-    messages.extend(session["messages"][-16:])
-    messages.append({"role": "user", "content": user_text})
+    response = await client.chat.completions.create(
+        model=AI_MODEL,
+        messages=messages,
+        temperature=0.5,
+    )
 
-    for _ in range(6):
-        response = await client.chat.completions.create(
-            model=COARENA_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.4,
-        )
+    answer = response.choices[0].message.content or "Sige."
 
-        message = response.choices[0].message
+    history.append({"role": "user", "content": text})
+    history.append({"role": "assistant", "content": answer})
+    save_history(user_id, history)
 
-        if not message.tool_calls:
-            answer = message.content or "Sige."
-            session["messages"].append(
-                {"role": "user", "content": user_text}
-            )
-            session["messages"].append(
-                {"role": "assistant", "content": answer}
-            )
-            session["messages"] = session["messages"][-24:]
-            return answer
+    return answer
 
-        messages.append(message.model_dump(exclude_none=True))
-
-        for call in message.tool_calls:
-            name = call.function.name
-            args = json.loads(call.function.arguments or "{}")
-
-            try:
-                result = await execute_tool(user_id, name, args)
-                result_text = json.dumps(result, ensure_ascii=False)
-            except Exception as exc:
-                log.exception("Tool failed: %s", name)
-                result_text = json.dumps({
-                    "error": str(exc)
-                }, ensure_ascii=False)
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": result_text,
-            })
-
-    return "Natapos ang tool processing limit. Pakisabi kung ano ang susunod."
-
-async def execute_tool(user_id: int, name: str, args: dict):
-    if name == "video_info":
-        return await asyncio.to_thread(tool_video_info, user_id)
-
-    if name == "compress_video":
-        return await asyncio.to_thread(
-            tool_compress, user_id, args["quality"]
-        )
-
-    if name == "make_tiktok":
-        return await asyncio.to_thread(tool_tiktok, user_id)
-
-    if name == "adjust_brightness":
-        return await asyncio.to_thread(
-            tool_brightness, user_id, args["amount"]
-        )
-
-    if name == "trim_video":
-        return await asyncio.to_thread(
-            tool_trim, user_id, args["start"], args["end"]
-        )
-
-    if name == "mute_video":
-        return await asyncio.to_thread(tool_mute, user_id)
-
-    if name == "add_text_overlay":
-        return await asyncio.to_thread(
-            tool_add_text, user_id, args["text"]
-        )
-
-    raise ValueError(f"Unknown tool: {name}")
-
-
-
-# --------------------------------------------------
+# =========================================================
 # TELEGRAM HANDLERS
-# --------------------------------------------------
+# =========================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I'm Deepyam AI Video + Social Studio.\n\n"
-        "Send a video and tell me naturally what you want.\n"
-        "Example: 'Compress mo pero preserve quality.'\n"
-        "Example: 'Gawin mong TikTok-ready.'\n"
-        "Example: 'Give me a caption and top 5 hashtags.'\n\n"
-        "You don't need slash commands to talk to me."
+        "Send a video, then tell me naturally what to do.\n"
+        "Example: Compress small.\n"
+        "Example: Make it TikTok-ready.\n"
+        "Example: Give me a caption and top 5 hashtags."
     )
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.message.reply_text(
-        "Send a video, then tell me what to do in normal Tagalog "
-        "or English.\n\n"
-        "I can currently:\n"
-        "• Compress video\n"
-        "• Convert to TikTok vertical format\n"
-        "• Adjust brightness\n"
-        "• Trim using seconds\n"
-        "• Mute audio\n"
-        "• Add text overlay\n"
-        "• Generate captions, hashtags, and keywords\n\n"
-        "Optional: /platform tiktok|youtube|facebook"
-    )
-
-async def platform_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def platform_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    session = get_session(user_id)
-
     if not context.args:
+        data = get_user(user_id)
         await update.message.reply_text(
-            f"Current platform: {session['platform']}\n"
-            "Use /platform tiktok, /platform youtube, "
-            "or /platform facebook."
+            f"Platform: {data.get('platform', 'tiktok')}"
         )
         return
 
     platform = context.args[0].lower()
-    allowed = {"tiktok", "youtube", "facebook"}
-
-    if platform not in allowed:
+    if platform not in ("tiktok", "youtube", "facebook"):
         await update.message.reply_text(
-            "Platform options: tiktok, youtube, facebook."
+            "Choose tiktok, youtube, or facebook."
         )
         return
 
-    session["platform"] = platform
-    await update.message.reply_text(
-        f"Platform set to {platform.title()}."
-    )
+    set_platform(user_id, platform)
+    await update.message.reply_text(f"Platform set to {platform.title()}.")
 
-async def video_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def upload_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message
-
     media = message.video or message.document
 
     if not media:
         return
 
     if message.document:
-        filename = (message.document.file_name or "").lower()
-        if not filename.endswith((".mp4", ".mov", ".mkv", ".webm")):
-            await message.reply_text(
-                "Please send a supported video file."
-            )
+        name = (message.document.file_name or "").lower()
+        if not name.endswith((".mp4", ".mov", ".mkv", ".webm")):
+            await message.reply_text("Please send a video file.")
             return
 
-    status = await message.reply_text(
-        "Video received. Preparing it for editing..."
-    )
+    async with get_lock(user_id):
+        status = await message.reply_text("Downloading video...")
 
-    try:
-        telegram_file = await context.bot.get_file(media.file_id)
+        try:
+            file = await context.bot.get_file(media.file_id)
+            path = str(WORK_DIR / f"{user_id}_{uuid.uuid4().hex}_input.mp4")
+            await file.download_to_drive(path)
 
-        local_path = str(
-            WORK_DIR / f"{user_id}_{uuid.uuid4().hex[:8]}_input.mp4"
-        )
+            # Verify completed download and valid video.
+            if not os.path.isfile(path) or os.path.getsize(path) < 1000:
+                raise RuntimeError("Download appears incomplete.")
 
-        await telegram_file.download_to_drive(local_path)
+            metadata = await asyncio.to_thread(ffprobe, path)
 
-        # Validate file using ffprobe.
-        await asyncio.to_thread(probe_video, local_path)
+            # Only set active video AFTER successful validation.
+            set_video(user_id, path)
 
-        get_session(user_id)["video"] = local_path
-
-        await status.edit_text(
-            "Video ready! Tell me what you'd like me to do."
-        )
-
-    except Exception as exc:
-        log.exception("Video download/validation failed")
-        await status.edit_text(
-            "Hindi ko ma-load ang video. "
-            "Try sending it as an MP4 video file.\n"
-            f"Details: {str(exc)[:300]}"
-        )
-
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    message = update.message
-
-    if not message or not message.text:
-        return
-
-    user_text = message.text.strip()
-    if not user_text:
-        return
-
-    session = get_session(user_id)
-    previous_video = session.get("video")
-
-    status = await message.reply_text("Thinking...")
-
-    try:
-        answer = await ask_ai(user_id, user_text)
-
-        await status.edit_text(answer[:4000])
-
-        current_video = session.get("video")
-
-        # If a tool produced a new file, send the actual video.
-        if (
-            current_video
-            and os.path.exists(current_video)
-            and current_video != previous_video
-        ):
-            await message.reply_text(
-                "Here's your edited video:"
+            duration = metadata.get("format", {}).get("duration", "?")
+            await status.edit_text(
+                f"Video ready! Duration: {duration} seconds.\n"
+                "Tell me what you'd like me to do."
             )
 
-            with open(current_video, "rb") as video_file:
-                await message.reply_video(
-                    video=video_file,
-                    supports_streaming=True,
-                    caption="Edited by Deepyam AI",
-                )
+        except Exception as exc:
+            log.exception("Upload failed")
+            await status.edit_text(
+                f"Video upload/validation failed: {str(exc)[:400]}"
+            )
 
-    except Exception as exc:
-        log.exception("AI request failed")
+async def send_edited_video(
+    update: Update,
+    path: str,
+    status,
+):
+    if not os.path.isfile(path):
         await status.edit_text(
-            "Nagkaroon ng error sa AI request.\n"
-            "Check your Coarena model/API settings.\n\n"
-            f"Details: {str(exc)[:500]}"
+            "Editing finished, but output file is missing."
+        )
+        return
+
+    size = os.path.getsize(path)
+    if size > 49 * 1024 * 1024:
+        await status.edit_text(
+            "The edited file is too large for Telegram video upload. "
+            "Try compressing it further."
+        )
+        return
+
+    await status.edit_text("Editing complete. Sending your video...")
+
+    with open(path, "rb") as f:
+        await update.message.reply_video(
+            video=f,
+            supports_streaming=True,
+            caption="Edited by Deepyam AI",
         )
 
-# --------------------------------------------------
+    await status.edit_text("Done! Your edited video was sent.")
+
+async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    # Support /ai natural text.
+    if text.startswith("/ai"):
+        text = text[3:].strip()
+    if not text:
+        await update.message.reply_text("Yes? Tell me what you need.")
+        return
+
+    async with get_lock(user_id):
+        status = await update.message.reply_text("Thinking...")
+
+        try:
+            # Deterministic edit routing fixes tool-call dependence.
+            edit = detect_edit(text)
+
+            if edit:
+                action, args = edit
+
+                if not get_video(user_id):
+                    await status.edit_text(
+                        "Wala akong active video file sa system. "
+                        "I-upload muli ang video at hintaying lumabas "
+                        "'Video ready' bago mag-request ng edit."
+                    )
+                    return
+
+                await status.edit_text("Editing your video with FFmpeg...")
+
+                result = await run_edit(user_id, action, args)
+                output = result["output"]
+
+                await send_edited_video(update, output, status)
+                return
+
+            answer = await ask_ai(user_id, text)
+            await status.edit_text(answer[:4000])
+
+        except Exception as exc:
+            log.exception("Message processing failed")
+            await status.edit_text(
+                "May error habang pinoproseso ang request:\n"
+                f"{str(exc)[:700]}"
+            )
+
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /ai hi routes into the same text pipeline
+    await process_text(update, context)
+
+# =========================================================
 # WEBHOOK
-# --------------------------------------------------
+# =========================================================
 
-telegram_app.add_handler(CommandHandler("start", start_command))
-telegram_app.add_handler(CommandHandler("help", help_command))
-telegram_app.add_handler(CommandHandler("platform", platform_command))
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(CommandHandler("platform", platform_cmd))
+bot_app.add_handler(CommandHandler("ai", ai_command))
 
-telegram_app.add_handler(
-    MessageHandler(
-        filters.VIDEO | filters.Document.ALL,
-        video_handler,
-    )
+bot_app.add_handler(
+    MessageHandler(filters.VIDEO | filters.Document.ALL, upload_video)
 )
-
-telegram_app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        text_handler,
-    )
+bot_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, process_text)
 )
 
 @app.on_event("startup")
-async def startup():
-    await telegram_app.initialize()
-    await telegram_app.start()
+async def on_startup():
+    await bot_app.initialize()
+    await bot_app.start()
 
     if PUBLIC_URL:
-        await telegram_app.bot.set_webhook(
+        await bot_app.bot.set_webhook(
             url=f"{PUBLIC_URL}/telegram",
             secret_token=WEBHOOK_SECRET,
         )
-        log.info("Telegram webhook configured.")
-    else:
-        log.warning(
-            "RENDER_EXTERNAL_URL missing. Webhook not configured."
-        )
+        log.info("Webhook configured.")
 
 @app.on_event("shutdown")
-async def shutdown():
-    await telegram_app.stop()
-    await telegram_app.shutdown()
+async def on_shutdown():
+    await bot_app.stop()
+    await bot_app.shutdown()
 
 @app.post("/telegram")
-async def telegram_webhook(request: Request):
-    secret = request.headers.get(
+async def webhook(request: Request):
+    token = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token", ""
     )
+    if token != WEBHOOK_SECRET:
+        return {"ok": False}
 
-    if secret != WEBHOOK_SECRET:
-        return {"ok": False, "error": "unauthorized"}
-
-    payload = await request.json()
-    update = Update.de_json(payload, telegram_app.bot)
-
-    await telegram_app.process_update(update)
+    data = await request.json()
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.process_update(update)
     return {"ok": True}
 
 @app.get("/")
 async def health():
     return {
-        "status": "Deepyam is running",
-        "ffmpeg": ffmpeg_exists(),
+        "status": "Deepyam running",
+        "active_database": DB_PATH,
+        "ffmpeg": bool(shutil.which("ffmpeg")),
     }
-
-
