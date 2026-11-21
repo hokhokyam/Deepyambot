@@ -1,37 +1,22 @@
-# Coarena Telegram AI + Video Bot
+# Coarena Telegram AI + FFmpeg bot
 
-## Files
-- `main.py`: Telegram webhook, natural AI chat with short in-memory context, basic video compress/MP4 conversion
-- `Dockerfile`: installs FFmpeg and Python dependencies
-- `render.yaml`: Render Blueprint settings
+Upload the video first. The bot temporarily downloads it, then wait for a separate instruction:
+- `compress` / `paliitin ang video`
+- `convert to MP4`
 
-## Required Render environment variables
-1. `TELEGRAM_BOT_TOKEN` — token from BotFather
-2. `COARENA_API_KEY` — your Coarena API key (never commit it)
-3. `COARENA_MODEL` — exact model ID that Coarena marks **Free**
-4. `WEBHOOK_SECRET` — Render generates this through Blueprint (optional if set manually)
+The bot executes FFmpeg and sends the processed file back. Text chat goes to Coarena AI.
+Only compression and MP4 conversion are implemented in this build. Do not assume arbitrary edit requests work yet.
 
-Render automatically provides `RENDER_EXTERNAL_URL` and `PORT`.
+## Render environment variables
+- `TELEGRAM_BOT_TOKEN`: Telegram BotFather token
+- `COARENA_API_KEY`: Coarena API key (secret; never put in GitHub)
+- `COARENA_MODEL`: exact model ID currently labeled Free in Coarena
+- `WEBHOOK_SECRET`: optional webhook secret
 
-## Coarena API
-OpenAI-compatible base URL: `https://coarena.ai/api/v1`
-The code uses the model selected in `COARENA_MODEL`. Do not guess the model name; choose a currently Free model in your Coarena model list. Free tiers have daily/rate limits and availability can change.
+Render supplies `RENDER_EXTERNAL_URL` and `PORT`.
 
-## Deploy
-1. Upload these files to the root of your GitHub repository.
-2. In Render, create or update a Docker web service connected to the repository. Root directory should be blank.
-3. Add the environment variables above and deploy.
-4. Visit the Render service URL; `/` should return `{"ok": true, ...}`.
+Coarena OpenAI-compatible API base URL: `https://coarena.ai/api/v1`
 
-## Bot commands
-- `/start`, `/help`
-- `/ai your prompt`
-- `/reset` clears the chat context
-- Plain text messages are sent to the AI
-- Send a video with caption `compress` or `convert mp4`
+Chat memory and last uploaded video are in RAM / temporary disk. Render restarts or sleeps can clear them. Use `/reset` to clear chat and video.
 
-## Important limitations
-- Chat context is stored in RAM and resets after service restart/sleep; this is not persistent database memory.
-- Render Free may sleep when inactive and wake slowly.
-- Video files are processed temporarily and not retained.
-- Only compression and MP4 conversion are implemented in this starter. It does not yet implement arbitrary AI-directed edits, trim, subtitles, or effects.
+Deploy all files to the root of your GitHub repository. Set Render service to Docker, Root Directory blank.
