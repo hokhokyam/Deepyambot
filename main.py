@@ -627,3 +627,55 @@ async def health():
         "active_database": DB_PATH,
         "ffmpeg": bool(shutil.which("ffmpeg")),
     }
+ACTIVE_FFMPEG = {}
+FFMPEG_LOCK = threading.Lock()
+
+
+class EditCancelled(Exception):
+    pass
+
+
+def stop_ffmpeg(user_id: int) -> bool:
+    with FFMPEG_LOCK:
+        entry = ACTIVE_FFMPEG.get(user_id)
+
+    if not entry:
+        return False
+
+    process = entry["process"]
+    entry["cancelled"].set()
+
+    if process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    return True
+
+
+def is_stop_request(text: str) -> bool:
+    text = text.lower().strip()
+
+    stop_phrases = [
+        "stop",
+        "stop edit",
+        "stop editing",
+        "stop it",
+        "cancel",
+        "cancel edit",
+        "cancel editing",
+        "abort",
+        "hinto",
+        "itigil",
+        "tigil",
+        "wag ituloy",
+        "huwag ituloy",
+    ]
+
+    return any(
+        text == phrase or text.startswith(phrase + " ")
+        for phrase in stop_phrases
+    )
