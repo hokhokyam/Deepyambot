@@ -1,14 +1,22 @@
+
 services:
   - type: web
-    name: deepyam-ai-social
+    name: deepyam-ai-video
     runtime: docker
     plan: free
+    healthCheckPath: /
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+
       - key: COARENA_API_KEY
         sync: false
+
       - key: COARENA_MODEL
-        sync: false
-      - key: WEBHOOK_URL
-        sync: false
+        value: deepseek-chat
+
+      - key: COARENA_BASE_URL
+        value: https://coarena.ai/api/v1
+
+      - key: WEBHOOK_SECRET
+        generateValue: true
