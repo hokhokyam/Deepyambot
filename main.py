@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -16,26 +17,28 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import OpenAI
-
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger("video-agent")
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+RENDER_URL = os.environ.get(
+    "RENDER_EXTERNAL_URL", ""
+).rstrip("/")
+
 WEBHOOK_SECRET = os.environ.get(
     "TELEGRAM_WEBHOOK_SECRET",
     "change-this-secret"
 )
 
-# DeepSeek API client
+# DeepSeek API
 deepseek = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
@@ -48,18 +51,18 @@ telegram_app = (
     .build()
 )
 
-# FastAPI server for Render webhook
+# FastAPI server
 app = FastAPI()
 
 
 # =====================================================
-# DEEPSEEK AI
+# DEEPSEEK VIDEO EDITING PLAN
 # =====================================================
 
 SYSTEM_PROMPT = """
-You are an AI video editing assistant.
+You are an AI video editing planner.
 
-Return ONLY valid JSON using this structure:
+Return ONLY valid JSON in this format:
 
 {
   "action": "compress",
@@ -78,8 +81,8 @@ Allowed actions:
 
 Rules:
 - Default action is compress.
-- For trim, use the start and end times requested.
-- For caption, use the text requested by the user.
+- For trim, use the requested start and end times.
+- For caption, use the requested caption text.
 - For resize, use the requested width.
 - Never return shell commands.
 - Never return executable code.
@@ -101,7 +104,9 @@ def get_ai_plan(user_instruction):
                 "content": user_instruction[:1500]
             }
         ],
-        response_format={"type": "json_object"}
+        response_format={
+            "type": "json_object"
+        }
     )
 
     result = json.loads(
@@ -124,20 +129,50 @@ def get_ai_plan(user_instruction):
     except (ValueError, TypeError):
         width = 720
 
-    result["width"] = max(320, min(1280, width))
+    result["width"] = max(
+        320,
+        min(1280, width)
+    )
 
     return result
 
 
 # =====================================================
-# VIDEO UTILITIES
+# DEEPSEEK CHAT
 # =====================================================
 
-def parse_timestamp(value, fallback="00:00:00"):
-    """
-    Accept MM:SS or HH:MM:SS timestamps.
-    """
+def ask_deepseek(user_prompt):
+    response = deepseek.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are DeepSeek, a helpful AI assistant "
+                    "inside a Telegram bot. "
+                    "Answer clearly and conversationally. "
+                    "You can help with video editing, "
+                    "technology, coding, and general questions."
+                )
+            },
+            {
+                "role": "user",
+                "content": user_prompt[:3000]
+            }
+        ]
+    )
 
+    return response.choices[0].message.content
+
+
+# =====================================================
+# TIMESTAMP UTILITIES
+# =====================================================
+
+def parse_timestamp(
+    value,
+    fallback="00:00:00"
+):
     if not isinstance(value, str):
         return fallback
 
@@ -147,7 +182,9 @@ def parse_timestamp(value, fallback="00:00:00"):
         return fallback
 
     try:
-        numbers = [int(part) for part in parts]
+        numbers = [
+            int(part) for part in parts
+        ]
     except ValueError:
         return fallback
 
@@ -161,23 +198,50 @@ def parse_timestamp(value, fallback="00:00:00"):
 
 
 def timestamp_to_seconds(value):
-    parts = [int(part) for part in value.split(":")]
+    parts = [
+        int(part) for part in value.split(":")
+    ]
 
     if len(parts) == 2:
         minutes, seconds = parts
-        return minutes * 60 + seconds
+
+        return (
+            minutes * 60
+            + seconds
+        )
 
     hours, minutes, seconds = parts
-    return hours * 3600 + minutes * 60 + seconds
+
+    return (
+        hours * 3600
+        + minutes * 60
+        + seconds
+    )
 
 
-def render_video(source, output, plan, temp_dir):
-    action = plan.get("action", "compress")
+# =====================================================
+# FFmpeg VIDEO EDITOR
+# =====================================================
+
+def render_video(
+    source,
+    output,
+    plan,
+    temp_dir
+):
+    action = plan.get(
+        "action",
+        "compress"
+    )
 
     command = ["ffmpeg", "-y"]
 
-    # Trim video
+    # ---------------------------------------------
+    # TRIM
+    # ---------------------------------------------
+
     if action == "trim":
+
         start = parse_timestamp(
             plan.get("start"),
             "00:00:00"
@@ -188,54 +252,88 @@ def render_video(source, output, plan, temp_dir):
             "00:00:15"
         )
 
-        start_seconds = timestamp_to_seconds(start)
-        end_seconds = timestamp_to_seconds(end)
+        start_seconds = timestamp_to_seconds(
+            start
+        )
 
-        duration = end_seconds - start_seconds
+        end_seconds = timestamp_to_seconds(
+            end
+        )
+
+        duration = (
+            end_seconds - start_seconds
+        )
 
         if duration <= 0:
             duration = 15
 
         command += [
-            "-ss", start,
-            "-i", str(source),
-            "-t", str(duration)
+            "-ss",
+            start,
+            "-i",
+            str(source),
+            "-t",
+            str(duration)
         ]
 
     else:
-        command += ["-i", str(source)]
+        command += [
+            "-i",
+            str(source)
+        ]
 
     command += [
-        "-map", "0:v:0",
-        "-map", "0:a?"
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?"
     ]
 
-    # Resize video
+    # ---------------------------------------------
+    # RESIZE
+    # ---------------------------------------------
+
     if action == "resize":
-        width = plan.get("width", 720)
+
+        width = plan.get(
+            "width",
+            720
+        )
 
         command += [
             "-vf",
             f"scale={width}:-2"
         ]
 
-    # Add caption
+    # ---------------------------------------------
+    # CAPTION
+    # ---------------------------------------------
+
     elif action == "caption":
+
         caption = str(
-            plan.get("caption", "Edited with AI")
+            plan.get(
+                "caption",
+                "Edited with AI"
+            )
         )[:120]
 
-        # Use a text file to avoid placing arbitrary
-        # user text directly inside an FFmpeg filter.
-        caption_file = Path(temp_dir) / "caption.txt"
+        caption_file = (
+            Path(temp_dir)
+            / "caption.txt"
+        )
+
         caption_file.write_text(
             caption,
             encoding="utf-8"
         )
 
-        caption_path = str(caption_file).replace(
-            "\\", "/"
-        ).replace(":", r"\:")
+        caption_path = str(
+            caption_file
+        ).replace("\\", "/").replace(
+            ":",
+            r"\:"
+        )
 
         command += [
             "-vf",
@@ -250,13 +348,21 @@ def render_video(source, output, plan, temp_dir):
             )
         ]
 
-    # Encode video
+    # ---------------------------------------------
+    # VIDEO ENCODING
+    # ---------------------------------------------
+
     command += [
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "28",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
         str(output)
     ]
 
@@ -272,7 +378,7 @@ def render_video(source, output, plan, temp_dir):
 
 
 # =====================================================
-# TELEGRAM COMMANDS
+# /START COMMAND
 # =====================================================
 
 async def start_command(
@@ -283,8 +389,12 @@ async def start_command(
 
     await message.reply_text(
         "Hello! I'm your AI Video Editing Bot. 🤖\n\n"
-        "Send me a video with an editing instruction "
-        "in its caption.\n\n"
+        "I'm online and ready!\n\n"
+        "AI CHAT:\n"
+        "/ai hello\n"
+        "/ai explain artificial intelligence\n\n"
+        "VIDEO EDITING:\n"
+        "Send a video with an instruction in its caption.\n\n"
         "Examples:\n"
         "• Compress this video\n"
         "• Trim from 00:00:03 to 00:00:12\n"
@@ -294,11 +404,80 @@ async def start_command(
     )
 
 
+# =====================================================
+# /HELP COMMAND
+# =====================================================
+
 async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    await start_command(update, context)
+    await start_command(
+        update,
+        context
+    )
+
+
+# =====================================================
+# /AI COMMAND
+# =====================================================
+
+async def ai_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.effective_message
+
+    user_prompt = " ".join(
+        context.args
+    ).strip()
+
+    if not user_prompt:
+
+        await message.reply_text(
+            "🤖 DeepSeek AI Chat\n\n"
+            "Example:\n"
+            "/ai hello\n"
+            "/ai give me video editing ideas\n"
+            "/ai explain Python"
+        )
+
+        return
+
+    status = await message.reply_text(
+        "🧠 DeepSeek is thinking..."
+    )
+
+    try:
+
+        answer = await asyncio.to_thread(
+            ask_deepseek,
+            user_prompt
+        )
+
+        if not answer:
+            answer = (
+                "DeepSeek returned an empty response."
+            )
+
+        # Telegram messages have a length limit.
+        answer = answer[:4000]
+
+        await status.edit_text(
+            answer
+        )
+
+    except Exception:
+
+        logger.exception(
+            "DeepSeek chat error"
+        )
+
+        await status.edit_text(
+            "❌ DeepSeek API error.\n\n"
+            "Please check your DEEPSEEK_API_KEY "
+            "and Render Logs."
+        )
 
 
 # =====================================================
@@ -314,24 +493,34 @@ async def text_handler(
     if not message or not message.text:
         return
 
-    user_text = message.text.lower().strip()
+    user_text = (
+        message.text.lower().strip()
+    )
 
-    if user_text in ["hi", "hello", "hey", "test"]:
+    if user_text in [
+        "hi",
+        "hello",
+        "hey",
+        "test"
+    ]:
+
         await message.reply_text(
             "Hello! 👋\n\n"
-            "I'm online and ready.\n"
-            "Send me a video with an editing instruction "
-            "in the caption to start editing."
+            "I'm online and ready.\n\n"
+            "Use /ai followed by your question "
+            "to chat with DeepSeek.\n\n"
+            "Send a video with an editing instruction "
+            "in its caption to edit it."
         )
 
-    elif "help" in user_text:
-        await help_command(update, context)
-
     else:
+
         await message.reply_text(
             "I received your message! ✅\n\n"
-            "To edit a video, send a video file and "
-            "write your instruction in its caption."
+            "To chat with DeepSeek, use:\n"
+            "/ai your question\n\n"
+            "To edit a video, send a video file "
+            "with your instruction in its caption."
         )
 
 
@@ -348,15 +537,21 @@ async def video_handler(
     media = message.video
 
     if not media and message.document:
-        mime_type = message.document.mime_type or ""
+
+        mime_type = (
+            message.document.mime_type
+            or ""
+        )
 
         if mime_type.startswith("video/"):
             media = message.document
 
     if not media:
+
         await message.reply_text(
             "Please send a video file."
         )
+
         return
 
     status = await message.reply_text(
@@ -364,15 +559,24 @@ async def video_handler(
     )
 
     try:
+
         with tempfile.TemporaryDirectory() as temp:
+
             temp_dir = Path(temp)
 
-            input_file = temp_dir / "input.mp4"
-            output_file = temp_dir / "edited.mp4"
+            input_file = (
+                temp_dir / "input.mp4"
+            )
 
-            # Download video from Telegram
-            telegram_file = await context.bot.get_file(
-                media.file_id
+            output_file = (
+                temp_dir / "edited.mp4"
+            )
+
+            # Download from Telegram
+            telegram_file = (
+                await context.bot.get_file(
+                    media.file_id
+                )
             )
 
             await telegram_file.download_to_drive(
@@ -384,21 +588,21 @@ async def video_handler(
                 or "Compress this video"
             )
 
+            # Ask DeepSeek for editing plan
             await status.edit_text(
                 "🧠 DeepSeek is planning your edit..."
             )
 
-            # Ask DeepSeek
             plan = await asyncio.to_thread(
                 get_ai_plan,
                 instruction
             )
 
+            # Render video
             await status.edit_text(
                 "🎬 FFmpeg is editing your video..."
             )
 
-            # Render with FFmpeg
             result = await asyncio.to_thread(
                 render_video,
                 input_file,
@@ -407,12 +611,16 @@ async def video_handler(
                 temp_dir
             )
 
+            # Send result
             await status.edit_text(
                 "📤 Sending your edited video..."
             )
 
-            # Send edited video back
-            with open(result, "rb") as video:
+            with open(
+                result,
+                "rb"
+            ) as video:
+
                 await message.reply_video(
                     video=video,
                     caption=(
@@ -425,13 +633,17 @@ async def video_handler(
             await status.delete()
 
     except subprocess.TimeoutExpired:
+
         await status.edit_text(
-            "⏱️ Video processing timed out.\n"
+            "⏱️ Video processing timed out.\n\n"
             "Try a shorter or smaller video."
         )
 
     except Exception:
-        logger.exception("Video processing error")
+
+        logger.exception(
+            "Video processing error"
+        )
 
         await status.edit_text(
             "❌ I couldn't process your video.\n\n"
@@ -445,14 +657,28 @@ async def video_handler(
 # =====================================================
 
 telegram_app.add_handler(
-    CommandHandler("start", start_command)
+    CommandHandler(
+        "start",
+        start_command
+    )
 )
 
 telegram_app.add_handler(
-    CommandHandler("help", help_command)
+    CommandHandler(
+        "help",
+        help_command
+    )
 )
 
-# Respond to ordinary text messages
+# DeepSeek AI command
+telegram_app.add_handler(
+    CommandHandler(
+        "ai",
+        ai_command
+    )
+)
+
+# Normal text messages
 telegram_app.add_handler(
     MessageHandler(
         filters.TEXT & ~filters.COMMAND,
@@ -460,58 +686,80 @@ telegram_app.add_handler(
     )
 )
 
-# Process video messages
+# Video messages
 telegram_app.add_handler(
     MessageHandler(
-        filters.VIDEO | filters.Document.VIDEO,
+        filters.VIDEO
+        | filters.Document.VIDEO,
         video_handler
     )
 )
 
 
 # =====================================================
-# FASTAPI / RENDER WEBHOOK
+# RENDER WEBHOOK
 # =====================================================
 
 @app.on_event("startup")
 async def startup():
+
     await telegram_app.initialize()
+
     await telegram_app.start()
 
     if RENDER_URL:
+
         webhook_url = (
-            f"{RENDER_URL}/telegram/{WEBHOOK_SECRET}"
+            f"{RENDER_URL}/telegram/"
+            f"{WEBHOOK_SECRET}"
         )
 
         await telegram_app.bot.set_webhook(
             webhook_url
         )
 
-        logger.info("Telegram webhook configured")
+        logger.info(
+            "Telegram webhook configured"
+        )
 
-    logger.info("Bot started successfully")
+    logger.info(
+        "Bot started successfully"
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown():
+
     await telegram_app.stop()
+
     await telegram_app.shutdown()
 
 
+# =====================================================
+# HEALTH CHECK
+# =====================================================
+
 @app.get("/")
 async def health_check():
+
     return {
         "status": "online",
         "service": "DeepSeek Telegram Video Agent"
     }
 
 
+# =====================================================
+# TELEGRAM WEBHOOK ENDPOINT
+# =====================================================
+
 @app.post("/telegram/{secret}")
 async def telegram_webhook(
     secret: str,
     request: Request
 ):
+
     if secret != WEBHOOK_SECRET:
+
         raise HTTPException(
             status_code=403,
             detail="Invalid webhook secret"
@@ -524,6 +772,10 @@ async def telegram_webhook(
         telegram_app.bot
     )
 
-    await telegram_app.update_queue.put(update)
+    await telegram_app.update_queue.put(
+        update
+    )
 
-    return {"ok": True}
+    return {
+        "ok": True
+    }
